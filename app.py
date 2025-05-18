@@ -9,11 +9,11 @@ from psycopg2.extras import RealDictCursor
 load_dotenv()
 
 # Database configuration from environment
-DB_HOST = os.getenv("DB_HOST", "190.86.135.192")
-DB_NAME = os.getenv("DB_NAME", "rmg_db")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_PORT = os.getenv("DB_PORT", "5432")
+DB_HOST = os.getenv("PGHOST", "cfls9h51f4i86c.cluster-czrs8kj4isg7.us-east-1.rds.amazonaws.com")
+DB_NAME = os.getenv("PGDATABASE", "dfc2jmocqkio6k")
+DB_USER = os.getenv("PGUSER", "uf6s7k0lvso94d")
+DB_PASSWORD = os.getenv("PGPASSWORD", "p26334802041005114bc98db3c5f0766326cca1abea7a6899ef860a12e79b95e8")
+DB_PORT = os.getenv("PGPORT", "5432")
 
 def get_db_connection():
     """
