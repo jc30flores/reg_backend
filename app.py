@@ -10,10 +10,10 @@ load_dotenv()
 
 # Database configuration from environment
 DB_HOST = os.getenv("PG_HOST", "cfls9h51f4i86c.cluster-czrs8kj4isg7.us-east-1.rds.amazonaws.com")
-DB_NAME = os.getenv("PGDATABASE", "dfc2jmocqkio6k")
-DB_USER = os.getenv("PGUSER", "uf6s7k0lvso94d")
-DB_PASSWORD = os.getenv("PGPASSWORD", "p26334802041005114bc98db3c5f0766326cca1abea7a6899ef860a12e79b95e8")
-DB_PORT = os.getenv("PGPORT", "5432")
+DB_NAME = os.getenv("PG_DATABASE", "dfc2jmocqkio6k")
+DB_USER = os.getenv("PG_USER", "uf6s7k0lvso94d")
+DB_PASSWORD = os.getenv("PG_PASSWORD", "p26334802041005114bc98db3c5f0766326cca1abea7a6899ef860a12e79b95e8")
+DB_PORT = os.getenv("PG_PORT", "5432")
 
 def get_db_connection():
     """
