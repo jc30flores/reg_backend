@@ -3,6 +3,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS, cross_origin
 from dotenv import load_dotenv
 import psycopg2
+from psycopg2 import errors as pg_errors
 from psycopg2.extras import RealDictCursor
 
 # Load environment variables from .env file
@@ -104,6 +105,266 @@ try:
     conn.close()
 except Exception as e:
     print(f"Warning: could not ensure 'access_code' column in 'employees': {e}")
+
+# -------------------------------------------------------------
+# Menu Categories Table (for Menu Management)
+# -------------------------------------------------------------
+
+# Ensure menu_categories table exists
+try:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS menu_categories (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            name TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """
+    )
+    conn.commit()
+
+    # Seed default categories if empty
+    cur.execute("SELECT COUNT(*) FROM menu_categories;")
+    if cur.fetchone()[0] == 0:
+        default_cats = ["Breakfast", "Lunch", "Dinner"]
+        for cat in default_cats:
+            cur.execute("INSERT INTO menu_categories (name) VALUES (%s) ON CONFLICT DO NOTHING;", (cat,))
+        conn.commit()
+
+    cur.close()
+    conn.close()
+except Exception as e:
+    print(f"Warning: could not ensure 'menu_categories' table: {e}")
+
+# -------------------------------------------------------------
+# Menu Categories API
+# -------------------------------------------------------------
+
+@app.route('/api/menu-categories', methods=['GET', 'POST', 'OPTIONS'])
+@cross_origin()
+def menu_categories_collection():
+    if request.method == 'GET':
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM menu_categories ORDER BY name;")
+        cats = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(cats)
+
+    # POST – create new category
+    data = request.get_json() or {}
+    name = data.get('name', '').strip()
+    if not name:
+        return jsonify({'error': 'Name is required'}), 400
+
+    # Title-case normalization (Pascal/Title)
+    name = ' '.join([w.capitalize() for w in name.split()])
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            "INSERT INTO menu_categories (name) VALUES (%s) RETURNING *;",
+            (name,)
+        )
+        new_cat = cur.fetchone()
+        conn.commit()
+    except pg_errors.UniqueViolation:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Category already exists'}), 409
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
+    cur.close()
+    conn.close()
+    return jsonify(new_cat), 201
+
+
+@app.route('/api/menu-categories/<string:cat_id>', methods=['PUT', 'DELETE', 'OPTIONS'])
+@cross_origin()
+def menu_category_item(cat_id):
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        name = data.get('name', '').strip()
+        if not name:
+            return jsonify({'error': 'Name is required'}), 400
+        name = ' '.join([w.capitalize() for w in name.split()])
+
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cur.execute(
+                "UPDATE menu_categories SET name = %s, updated_at = NOW() WHERE id = %s RETURNING *;",
+                (name, cat_id)
+            )
+            updated = cur.fetchone()
+            conn.commit()
+        except pg_errors.UniqueViolation:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Category already exists'}), 409
+        except Exception as e:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({'error': str(e)}), 500
+
+        cur.close()
+        conn.close()
+        if updated:
+            return jsonify(updated)
+        return jsonify({'error': 'Category not found'}), 404
+
+    # DELETE
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    # First delete related menu_items
+    cur.execute("SELECT name FROM menu_categories WHERE id = %s;", (cat_id,))
+    cat_row = cur.fetchone()
+    if cat_row:
+        cat_name = cat_row['name']
+        cur.execute("DELETE FROM menu_items WHERE LOWER(category) = LOWER(%s);", (cat_name,))
+
+    cur.execute("DELETE FROM menu_categories WHERE id = %s RETURNING id;", (cat_id,))
+    deleted = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted:
+        return jsonify({'id': deleted['id']})
+    return jsonify({'error': 'Category not found'}), 404
+
+# -------------------------------------------------------------
+# Menu Sub-categories table and API
+# -------------------------------------------------------------
+
+# Ensure menu_subcategories exists
+try:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS menu_subcategories (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            category_id UUID REFERENCES menu_categories(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE (category_id, name)
+        );
+        """
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+except Exception as e:
+    print(f"Warning: could not ensure 'menu_subcategories' table: {e}")
+
+
+@app.route('/api/subcategories', methods=['GET', 'POST', 'OPTIONS'])
+@cross_origin()
+def subcategories_collection():
+    if request.method == 'GET':
+        cat_id = request.args.get('category_id')
+        sql = "SELECT * FROM menu_subcategories"
+        params = ()
+        if cat_id:
+            sql += " WHERE category_id = %s"
+            params = (cat_id,)
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(rows)
+
+    # POST
+    data = request.get_json() or {}
+    name        = data.get('name', '').strip()
+    category_id = data.get('category_id')
+    if not name or not category_id:
+        return jsonify({'error': 'name and category_id required'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            "INSERT INTO menu_subcategories (name, category_id) VALUES (%s, %s) RETURNING *;",
+            (name.title(), category_id)
+        )
+        new_sub = cur.fetchone()
+        conn.commit()
+    except pg_errors.UniqueViolation:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Subcategory already exists'}), 409
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
+    cur.close()
+    conn.close()
+    return jsonify(new_sub), 201
+
+
+@app.route('/api/subcategories/<string:sub_id>', methods=['PUT', 'DELETE', 'OPTIONS'])
+@cross_origin()
+def subcategory_item(sub_id):
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        name = data.get('name', '').strip()
+        if not name:
+            return jsonify({'error': 'name required'}), 400
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cur.execute(
+                "UPDATE menu_subcategories SET name = %s, updated_at = NOW() WHERE id = %s RETURNING *;",
+                (name.title(), sub_id)
+            )
+            updated = cur.fetchone()
+            conn.commit()
+        except pg_errors.UniqueViolation:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Subcategory already exists'}), 409
+        except Exception as e:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({'error': str(e)}), 500
+        cur.close()
+        conn.close()
+        if updated:
+            return jsonify(updated)
+        return jsonify({'error': 'Subcategory not found'}), 404
+
+    # DELETE
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("DELETE FROM menu_subcategories WHERE id = %s RETURNING id;", (sub_id,))
+    deleted = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted:
+        return jsonify({'id': deleted['id']})
+    return jsonify({'error': 'Subcategory not found'}), 404
 
 ### Map Elements Endpoints ###
 @app.route('/api/elements', methods=['GET'])
@@ -274,20 +535,30 @@ def delete_table(table_id):
         return jsonify({'error': 'Table not found'}), 404
 
 @app.route('/api/menu', methods=['GET'])
+@cross_origin()
 def get_menu():
+    """Return all menu items along with their category relation."""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM menu_items;")
+    cur.execute(
+        """
+        SELECT mi.*, mc.name AS category_name
+        FROM menu_items mi
+        JOIN menu_categories mc ON mc.id = mi.category_id
+        ORDER BY mc.name, mi.name;
+        """
+    )
     items = cur.fetchall()
     cur.close()
     conn.close()
     return jsonify(items)
     
-@app.route('/api/menu', methods=['POST'])
+@app.route('/api/menu', methods=['POST', 'OPTIONS'])
+@cross_origin()
 def create_menu_item():
     data = request.get_json()
     columns, values, placeholders = [], [], []
-    for key in ['name', 'price', 'category', 'image']:
+    for key in ['name', 'price', 'category_id', 'subcategory_id', 'image', 'is_active']:
         if key in data:
             columns.append(key)
             values.append(data[key])
@@ -304,12 +575,13 @@ def create_menu_item():
     conn.close()
     return jsonify(new_item), 201
 
-@app.route('/api/menu/<string:item_id>', methods=['PUT', 'DELETE'])
+@app.route('/api/menu/<string:item_id>', methods=['PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+@cross_origin()
 def modify_menu_item(item_id):
-    if request.method == 'PUT':
-        data = request.get_json()
+    if request.method == 'PUT' or request.method == 'PATCH':
+        data = request.get_json() or {}
         fields, values = [], []
-        for key in ['name', 'price', 'category', 'image']:
+        for key in ['name', 'price', 'category_id', 'subcategory_id', 'image', 'is_active']:
             if key in data:
                 fields.append(f"{key} = %s")
                 values.append(data[key])
@@ -449,7 +721,9 @@ def create_order_item():
     conn.close()
     return jsonify(new_item), 201
 
-@app.route('/api/employees', methods=['GET', 'POST'])
+# Employee collection endpoints
+@app.route('/api/employees', methods=['GET', 'POST', 'OPTIONS'])
+@cross_origin()
 def employees():
     """
     GET: List all employees.
@@ -485,6 +759,85 @@ def employees():
         cur.close()
         conn.close()
         return jsonify(new_emp), 201
+
+# Endpoint to get, update, or delete a single employee by id
+@app.route('/api/employees/<string:employee_id>', methods=['GET', 'PUT', 'DELETE', 'OPTIONS'])
+@cross_origin()
+def employee_item(employee_id):
+    """CRUD operations for a single employee record."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    if request.method == 'GET':
+        # Fetch employee by id
+        cur.execute("SELECT * FROM employees WHERE id = %s;", (employee_id,))
+        employee = cur.fetchone()
+        cur.close()
+        conn.close()
+        if employee:
+            return jsonify(employee)
+        return jsonify({'error': 'Employee not found'}), 404
+
+    elif request.method == 'PUT':
+        data = request.get_json() or {}
+
+        # Accept only known columns to avoid SQL errors / injection
+        allowed_fields = [
+            'name', 'position', 'status', 'hourly_rate', 'clock_in',
+            'clock_out', 'break_start', 'break_end', 'access_code'
+        ]
+
+        fields, values = [], []
+        for key in allowed_fields:
+            if key in data:
+                fields.append(f"{key} = %s")
+                values.append(data[key])
+
+        if not fields:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'No valid fields provided'}), 400
+
+        # Always update the timestamp
+        fields.append('updated_at = NOW()')
+
+        # Build and execute the update query
+        values.append(employee_id)
+        sql = f"UPDATE employees SET {', '.join(fields)} WHERE id = %s RETURNING *;"
+        try:
+            cur.execute(sql, tuple(values))
+            updated = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({'error': str(e)}), 500
+
+        cur.close()
+        conn.close()
+
+        if updated:
+            return jsonify(updated)
+        return jsonify({'error': 'Employee not found'}), 404
+
+    else:  # DELETE
+        try:
+            cur.execute("DELETE FROM employees WHERE id = %s RETURNING id;", (employee_id,))
+            deleted = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({'error': str(e)}), 500
+
+        cur.close()
+        conn.close()
+
+        if deleted:
+            return jsonify({'id': deleted['id']})
+        return jsonify({'error': 'Employee not found'}), 404
 
 @app.route('/api/inventory', methods=['GET'])
 def get_inventory():
