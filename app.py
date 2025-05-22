@@ -32,9 +32,18 @@ def get_db_connection():
 
 # Initialize Flask app
 app = Flask(__name__)
-# Configure CORS to allow requests from the frontend for all /api/*
-# Configure CORS to allow all origins and methods for API and elements endpoints
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+# Configure CORS to allow requests from the frontend
+CORS(app, origins="*", supports_credentials=True)
+@app.after_request
+def apply_cors_headers(response):
+    """
+    Ensure CORS headers are set on all responses, including preflight OPTIONS.
+    """
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET,PUT,POST,DELETE,OPTIONS"
+    return response
 # Ensure 'shape', 'rotation', and 'color' columns exist in 'tables'
 try:
     conn = get_db_connection()
@@ -365,6 +374,293 @@ def subcategory_item(sub_id):
     if deleted:
         return jsonify({'id': deleted['id']})
     return jsonify({'error': 'Subcategory not found'}), 404
+
+# -------------------------------------------------------------
+# Customization tables (groups, options, and menu item relations)
+# -------------------------------------------------------------
+
+# Ensure customization tables exist
+try:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Ensure UUID extension for uuid_generate_v4()
+    cur.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
+    # Create customization tables if missing
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS customization_groups (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            name TEXT UNIQUE NOT NULL,
+            is_required BOOLEAN DEFAULT FALSE,
+            max_select INT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS customization_options (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            group_id UUID REFERENCES customization_groups(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            extra_price NUMERIC DEFAULT 0,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS menu_item_customizations (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            menu_item_id UUID REFERENCES menu_items(id) ON DELETE CASCADE,
+            group_id UUID REFERENCES customization_groups(id) ON DELETE CASCADE
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS menu_item_customization_options (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            item_id UUID REFERENCES menu_items(id) ON DELETE CASCADE,
+            option_id UUID REFERENCES customization_options(id) ON DELETE CASCADE
+        );
+        """
+    )
+    # Commit initial table creation
+    conn.commit()
+    # Ensure columns exist in menu_item_customizations
+    cur.execute(
+        "ALTER TABLE menu_item_customizations ADD COLUMN IF NOT EXISTS menu_item_id UUID REFERENCES menu_items(id) ON DELETE CASCADE;"
+    )
+    cur.execute(
+        "ALTER TABLE menu_item_customizations ADD COLUMN IF NOT EXISTS group_id UUID REFERENCES customization_groups(id) ON DELETE CASCADE;"
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+except Exception as e:
+    print(f"Warning: could not ensure customization tables: {e}")
+
+@app.route('/api/customization-groups', methods=['GET', 'POST', 'OPTIONS'])
+@cross_origin()
+def customization_groups_collection():
+    if request.method == 'GET':
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM customization_groups ORDER BY name;")
+        groups = cur.fetchall()
+        cur.execute("SELECT * FROM customization_options;")
+        options = cur.fetchall()
+        cur.close()
+        conn.close()
+        for g in groups:
+            g['options'] = [o for o in options if o['group_id'] == g['id']]
+        return jsonify(groups)
+
+    data = request.get_json() or {}
+    name = data.get('name', '').strip()
+    is_required = data.get('is_required', False)
+    max_select = data.get('max_select')
+    if not name:
+        return jsonify({'error': 'name required'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            "INSERT INTO customization_groups (name, is_required, max_select) VALUES (%s, %s, %s) RETURNING *;",
+            (name, is_required, max_select),
+        )
+        group = cur.fetchone()
+        conn.commit()
+    except pg_errors.UniqueViolation:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Group exists'}), 409
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
+    cur.close()
+    conn.close()
+    group['options'] = []
+    return jsonify(group), 201
+
+
+@app.route('/api/customization-groups/<string:gid>', methods=['PUT', 'DELETE', 'OPTIONS'])
+@cross_origin()
+def customization_group_item(gid):
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        fields, vals = [], []
+        for key in ['name', 'is_required', 'max_select']:
+            if key in data:
+                fields.append(f"{key} = %s")
+                vals.append(data[key])
+        if not fields:
+            return jsonify({'error': 'no data'}), 400
+        vals.append(gid)
+        sql = f"UPDATE customization_groups SET {', '.join(fields)}, updated_at = NOW() WHERE id = %s RETURNING *;"
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql, tuple(vals))
+        updated = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if updated:
+            return jsonify(updated)
+        return jsonify({'error': 'Group not found'}), 404
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("DELETE FROM customization_groups WHERE id = %s RETURNING id;", (gid,))
+    deleted = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted:
+        return jsonify({'id': deleted['id']})
+    return jsonify({'error': 'Group not found'}), 404
+
+
+@app.route('/api/customization-options', methods=['GET', 'POST', 'OPTIONS'])
+@cross_origin()
+def customization_options_collection():
+    if request.method == 'GET':
+        gid = request.args.get('group_id')
+        sql = "SELECT * FROM customization_options"
+        params = ()
+        if gid:
+            sql += " WHERE group_id = %s"
+            params = (gid,)
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql, params)
+        opts = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(opts)
+
+    data = request.get_json() or {}
+    gid = data.get('group_id')
+    name = data.get('name', '').strip()
+    extra = data.get('extra_price', 0)
+    if not gid or not name:
+        return jsonify({'error': 'group_id and name required'}), 400
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute(
+        "INSERT INTO customization_options (group_id, name, extra_price) VALUES (%s, %s, %s) RETURNING *;",
+        (gid, name, extra),
+    )
+    opt = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify(opt), 201
+
+
+@app.route('/api/customization-options/<string:oid>', methods=['PUT', 'DELETE', 'OPTIONS'])
+@cross_origin()
+def customization_option_item(oid):
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        fields, vals = [], []
+        for key in ['name', 'extra_price']:
+            if key in data:
+                fields.append(f"{key} = %s")
+                vals.append(data[key])
+        if not fields:
+            return jsonify({'error': 'no data'}), 400
+        vals.append(oid)
+        sql = f"UPDATE customization_options SET {', '.join(fields)}, updated_at = NOW() WHERE id = %s RETURNING *;"
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql, tuple(vals))
+        updated = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if updated:
+            return jsonify(updated)
+        return jsonify({'error': 'Option not found'}), 404
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("DELETE FROM customization_options WHERE id = %s RETURNING id;", (oid,))
+    deleted = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted:
+        return jsonify({'id': deleted['id']})
+    return jsonify({'error': 'Option not found'}), 404
+
+
+@app.route('/api/menu-items/<string:item_id>/customizations', methods=['GET', 'PUT', 'OPTIONS'])
+@cross_origin()
+def menu_item_customizations_endpoint(item_id):
+    if request.method == 'GET':
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """
+            SELECT mic.id as mic_id, g.id, g.name, g.is_required, g.max_select,
+                   json_agg(json_build_object(
+                        'id', o.id,
+                        'name', o.name,
+                        'extra_price', o.extra_price,
+                        'allowed', mico.id IS NOT NULL
+                   ) ORDER BY o.name) AS options
+            FROM menu_item_customizations mic
+            JOIN customization_groups g ON g.id = mic.group_id
+            JOIN customization_options o ON o.group_id = g.id
+            LEFT JOIN menu_item_customization_options mico
+                ON mico.item_id = mic.menu_item_id
+                AND mico.option_id = o.id
+            WHERE mic.menu_item_id = %s
+            GROUP BY mic.id, g.id
+            ORDER BY g.name;
+            """,
+            (item_id,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(rows)
+
+    data = request.get_json() or {}
+    groups = data.get('groups', [])
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM menu_item_customization_options WHERE item_id = %s;",
+        (item_id,),
+    )
+    cur.execute("DELETE FROM menu_item_customizations WHERE menu_item_id = %s;", (item_id,))
+    for grp in groups:
+        gid = grp.get('group_id')
+        option_ids = grp.get('option_ids', [])
+        cur.execute(
+            "INSERT INTO menu_item_customizations (menu_item_id, group_id) VALUES (%s, %s) RETURNING id;",
+            (item_id, gid),
+        )
+        mic_id = cur.fetchone()[0]
+        for oid in option_ids:
+            cur.execute(
+                "INSERT INTO menu_item_customization_options (item_id, option_id) VALUES (%s, %s);",
+                (item_id, oid),
+            )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'status': 'ok'})
 
 ### Map Elements Endpoints ###
 @app.route('/api/elements', methods=['GET'])
