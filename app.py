@@ -1,5 +1,6 @@
 import os
 from flask import Flask, jsonify, request
+import uuid
 from flask_cors import CORS, cross_origin
 from dotenv import load_dotenv
 import psycopg2
@@ -443,6 +444,35 @@ try:
 except Exception as e:
     print(f"Warning: could not ensure customization tables: {e}")
 
+# Ensure linked table group tables exist
+try:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS linked_table_groups (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS linked_table_members (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            group_id UUID REFERENCES linked_table_groups(id) ON DELETE CASCADE,
+            table_number TEXT NOT NULL,
+            is_leader BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+except Exception as e:
+    print(f"Warning: could not ensure 'linked_table_groups' tables: {e}")
+
 @app.route('/api/customization-groups', methods=['GET', 'POST', 'OPTIONS'])
 @cross_origin()
 def customization_groups_collection():
@@ -742,12 +772,25 @@ def delete_element(elem_id):
 def ping():
     """Health check endpoint returning a simple pong response."""
     return jsonify({"message": "pong"})
+
+# Dedicated health check used by the frontend to verify backend readiness
+@app.route('/api/health', methods=['GET'])
+@cross_origin()
+def healthcheck():
+    """Return simple status used for readiness probes."""
+    return jsonify({"status": "ok"})
     
 @app.route('/api/tables', methods=['GET'])
 def get_tables():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM tables;")
+    cur.execute(
+        """
+        SELECT t.*, l.group_id
+        FROM tables t
+        LEFT JOIN linked_table_members l ON t.number = l.table_number;
+        """
+    )
     tables = cur.fetchall()
     cur.close()
     conn.close()
@@ -757,7 +800,15 @@ def get_tables():
 def get_table(table_id):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM tables WHERE id = %s;", (table_id,))
+    cur.execute(
+        """
+        SELECT t.*, l.group_id
+        FROM tables t
+        LEFT JOIN linked_table_members l ON t.number = l.table_number
+        WHERE t.id = %s;
+        """,
+        (table_id,)
+    )
     table = cur.fetchone()
     cur.close()
     conn.close()
@@ -912,6 +963,22 @@ def modify_menu_item(item_id):
 @app.route('/api/orders', methods=['POST'])
 def create_order():
     data = request.get_json()
+    table_number = data.get('table_number')
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    # If a table number is provided, check for an existing open order
+    if table_number:
+        cur.execute(
+            "SELECT * FROM orders WHERE table_number = %s AND status != 'paid' ORDER BY created_at DESC LIMIT 1;",
+            (table_number,)
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.close()
+            conn.close()
+            return jsonify(existing)
+
     columns = []
     values = []
     placeholders = []
@@ -923,8 +990,6 @@ def create_order():
     if not columns:
         return jsonify({"error": "No order data provided"}), 400
     sql = f"INSERT INTO orders ({', '.join(columns)}) VALUES ({', '.join(placeholders)}) RETURNING *;"
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute(sql, tuple(values))
     new_order = cur.fetchone()
     conn.commit()
@@ -963,7 +1028,7 @@ def update_order(order_id):
     data = request.get_json()
     fields = []
     values = []
-    for key in ['status', 'payment_method', 'paid']:
+    for key in ['status', 'payment_method', 'paid', 'subtotal', 'tax', 'tip', 'total', 'discount_type', 'discount_value', 'client_count']:
         if key in data:
             fields.append(f"{key} = %s")
             values.append(data[key])
@@ -983,6 +1048,148 @@ def update_order(order_id):
         return jsonify(updated)
     else:
         return jsonify({"error": "Order not found"}), 404
+
+@app.route('/api/orders/merge', methods=['POST'])
+def merge_orders_endpoint():
+    data = request.get_json() or {}
+    source_id = data.get('source_order_id')
+    target_id = data.get('target_order_id')
+    if not source_id or not target_id:
+        return jsonify({'error': 'source_order_id and target_order_id required'}), 400
+
+    # Validate UUIDs to avoid executing queries with malformed values
+    try:
+        uuid.UUID(source_id)
+        uuid.UUID(target_id)
+    except Exception:
+        return jsonify({'error': 'Invalid order id format'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT * FROM orders WHERE id = %s;", (source_id,))
+        source_order = cur.fetchone()
+        cur.execute("SELECT * FROM orders WHERE id = %s;", (target_id,))
+        target_order = cur.fetchone()
+        if not source_order:
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'Source order {source_id} not found'}), 404
+        if not target_order:
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'Target order {target_id} not found'}), 404
+        if source_order['status'] == 'paid' or target_order['status'] == 'paid':
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Cannot merge paid orders'}), 400
+
+        offset = target_order.get('client_count') or 0
+
+        cur.execute(
+            """UPDATE order_items SET order_id = %s, client_number = COALESCE(client_number,1) + %s WHERE order_id = %s RETURNING id""",
+            (target_id, offset, source_id)
+        )
+        cur.fetchall()  # ensure execution
+
+        new_client_count = (target_order.get('client_count') or 0) + (source_order.get('client_count') or 0)
+        new_subtotal = (target_order.get('subtotal') or 0) + (source_order.get('subtotal') or 0)
+        new_tax = (target_order.get('tax') or 0) + (source_order.get('tax') or 0)
+        new_tip = (target_order.get('tip') or 0) + (source_order.get('tip') or 0)
+        new_total = (target_order.get('total') or 0) + (source_order.get('total') or 0)
+
+        cur.execute(
+            "UPDATE orders SET client_count = %s, subtotal = %s, tax = %s, tip = %s, total = %s, updated_at = NOW() WHERE id = %s RETURNING *;",
+            (new_client_count, new_subtotal, new_tax, new_tip, new_total, target_id)
+        )
+        updated_target = cur.fetchone()
+
+        cur.execute("DELETE FROM orders WHERE id = %s;", (source_id,))
+
+        if source_order.get('table_number'):
+            cur.execute("UPDATE tables SET status = 'available' WHERE number = %s;", (source_order['table_number'],))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(updated_target)
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
+# Move an order to a different table
+@app.route('/api/orders/change-table', methods=['POST'])
+def change_order_table_endpoint():
+    data = request.get_json() or {}
+    order_id = data.get('order_id')
+    new_table = data.get('table_number')
+    if not order_id or not new_table:
+        return jsonify({'error': 'order_id and table_number required'}), 400
+
+    try:
+        uuid.UUID(order_id)
+    except Exception:
+        return jsonify({'error': 'Invalid order id format'}), 400
+
+    print(f"Change order {order_id} -> table {new_table}")
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Validate order exists
+        cur.execute("SELECT * FROM orders WHERE id = %s;", (order_id,))
+        order = cur.fetchone()
+        if not order:
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'Order {order_id} not found'}), 404
+
+        # Validate target table exists
+        cur.execute("SELECT id FROM tables WHERE number = %s;", (new_table,))
+        target_table = cur.fetchone()
+        if not target_table:
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'Table {new_table} not found'}), 404
+
+        # Ensure no active order already assigned to target table
+        cur.execute(
+            "SELECT id FROM orders WHERE table_number = %s AND status != 'paid';",
+            (new_table,),
+        )
+        existing = cur.fetchone()
+        if existing and existing['id'] != order_id:
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'Table {new_table} already has an active order'}), 400
+
+        cur.execute(
+            "UPDATE orders SET table_number = %s, updated_at = NOW() WHERE id = %s RETURNING *;",
+            (new_table, order_id),
+        )
+        updated_order = cur.fetchone()
+
+        if order.get('table_number'):
+            cur.execute(
+                "UPDATE tables SET status = 'available' WHERE number = %s;",
+                (order['table_number'],),
+            )
+        cur.execute(
+            "UPDATE tables SET status = 'occupied' WHERE number = %s;",
+            (new_table,),
+        )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(updated_order)
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/order-items/<string:order_id>', methods=['GET'])
 def get_order_items(order_id):
@@ -1016,6 +1223,124 @@ def create_order_item():
     cur.close()
     conn.close()
     return jsonify(new_item), 201
+
+# ----------- Linked Tables Endpoints -----------
+
+@app.route('/api/table-links', methods=['GET', 'POST'])
+def table_links_collection():
+    if request.method == 'GET':
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """
+            SELECT g.id as group_id,
+                   json_agg(json_build_object('table_number',m.table_number,'is_leader',m.is_leader)) AS tables
+            FROM linked_table_groups g
+            JOIN linked_table_members m ON m.group_id = g.id
+            GROUP BY g.id;
+            """
+        )
+        groups = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(groups)
+    else:
+        data = request.get_json() or {}
+        leader = data.get('leader')
+        tables = data.get('tables') or []
+        if not leader or not tables:
+            return jsonify({'error': 'leader and tables required'}), 400
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            placeholders = ','.join(['%s'] * (len(tables) + 1))
+            cur.execute(f"SELECT table_number FROM linked_table_members WHERE table_number IN ({placeholders});", tuple([leader] + tables))
+            existing = cur.fetchall()
+            if existing:
+                raise Exception('One or more tables already linked')
+            cur.execute("INSERT INTO linked_table_groups DEFAULT VALUES RETURNING id;")
+            gid = cur.fetchone()['id']
+            cur.execute("INSERT INTO linked_table_members (group_id, table_number, is_leader) VALUES (%s,%s,true);", (gid, leader))
+            for t in tables:
+                cur.execute("INSERT INTO linked_table_members (group_id, table_number) VALUES (%s,%s);", (gid, t))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return jsonify({'group_id': gid}), 201
+        except Exception as e:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/table-links/table/<string:table_number>', methods=['GET'])
+def get_table_link(table_number):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute(
+        """
+        SELECT g.id as group_id,
+               json_agg(json_build_object('table_number',m.table_number,'is_leader',m.is_leader)) AS tables
+        FROM linked_table_groups g
+        JOIN linked_table_members m ON m.group_id = g.id
+        WHERE m.table_number = %s
+        GROUP BY g.id;
+        """,
+        (table_number,)
+    )
+    group = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not group:
+        return jsonify({})
+    return jsonify(group)
+
+
+@app.route('/api/table-links/<string:group_id>', methods=['DELETE'])
+def delete_table_link(group_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM linked_table_groups WHERE id = %s RETURNING id;", (group_id,))
+    deleted = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted:
+        return jsonify({'id': deleted[0]})
+    return jsonify({'error': 'Not found'}), 404
+
+
+@app.route('/api/pay-linked/<string:table_number>', methods=['POST'])
+def pay_linked_group(table_number):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT group_id FROM linked_table_members WHERE table_number = %s;", (table_number,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Table not linked'}), 404
+        gid = row['group_id']
+        cur.execute("SELECT table_number FROM linked_table_members WHERE group_id = %s;", (gid,))
+        tables = [r['table_number'] for r in cur.fetchall()]
+        cur.execute("SELECT * FROM orders WHERE table_number = ANY(%s) AND status != 'paid';", (tables,))
+        orders = cur.fetchall()
+        for o in orders:
+            cur.execute("UPDATE orders SET status = 'paid', updated_at = NOW() WHERE id = %s;", (o['id'],))
+            if o['table_number']:
+                cur.execute("UPDATE tables SET status = 'available' WHERE number = %s;", (o['table_number'],))
+        cur.execute("DELETE FROM linked_table_groups WHERE id = %s;", (gid,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'paid_orders': [o['id'] for o in orders]})
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': str(e)}), 500
 
 # Employee collection endpoints
 @app.route('/api/employees', methods=['GET', 'POST', 'OPTIONS'])
@@ -1476,5 +1801,22 @@ except Exception as e:
 
 if __name__ == '__main__':
     import os
-    port = int(os.getenv('FLASK_PORT', '5050'))  # usa 5050 por defecto si no existe FLASK_PORT
-    app.run(host='0.0.0.0', port=port, debug=True)
+    import time
+
+    def run_server():
+        """Run Flask app with retry to avoid socket errors on restart."""
+        port = int(os.getenv('FLASK_PORT', '5050'))
+        attempts = 0
+        while attempts < 3:
+            try:
+                app.run(host='0.0.0.0', port=port, debug=True)
+                break
+            except OSError as e:
+                if e.errno == 57:
+                    print("Socket not connected, retrying...")
+                    attempts += 1
+                    time.sleep(1)
+                else:
+                    raise
+
+    run_server()

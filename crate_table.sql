@@ -179,3 +179,17 @@ CREATE TABLE IF NOT EXISTS map_elements (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- Linked tables for shared billing
+CREATE TABLE IF NOT EXISTS linked_table_groups (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS linked_table_members (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    group_id UUID REFERENCES linked_table_groups(id) ON DELETE CASCADE,
+    table_number TEXT NOT NULL,
+    is_leader BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
